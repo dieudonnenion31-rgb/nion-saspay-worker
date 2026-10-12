@@ -1,19 +1,18 @@
 /**
  * Worker Cloudflare — passerelle sécurisée entre Nion Market et l'API SasPay.
- * La clé API SasPay reste ici (en secret côté serveur), jamais dans index.html.
+ * La clé API SasPay reste ici (secret SASPAY_API_KEY), jamais dans index.html.
  *
  * Basé sur la doc officielle SasPay (docs.saspay.me) :
  * - Base URL : https://api.saspay.me/api/v1
- * - Création de paiement : POST /payments/softpay/ (avec Idempotency-Key)
- * - Vérification : GET /payments/{id}/verify/ — ne jamais faire confiance à
- *   un simple délai, le statut de succès réel est la chaîne "SUCCESS".
- * - Montant : chaîne décimale ("2500.00"), jamais un nombre flottant.
- * - On n'envoie pas de "network" : SasPay retourne alors un checkout_url
- *   (page hébergée) où le client choisit lui-même Orange/Moov/carte.
+ * - Page de paiement hébergée : POST /checkout-sessions/ -> data.checkout_url
+ * - Statut d'une session : GET /checkout-sessions/{id}/status/
+ * - Toutes les réponses sont enveloppées : { success, data: {...}, code }
+ * - Montant : chaîne décimale ("5000.00"), jamais un nombre flottant.
  */
 
-const ALLOWED_ORIGIN = "*"; // À remplacer plus tard par votre domaine exact si besoin
+const ALLOWED_ORIGIN = "*";
 const SASPAY_BASE_URL = "https://api.saspay.me/api/v1";
+const RETURN_URL = "https://nion-market-boutique1.netlify.app/";
 
 function corsHeaders(){
   return {
@@ -30,41 +29,37 @@ function json(data, status = 200){
   });
 }
 
-// Crée un paiement SasPay. Sans "network" précisé, SasPay renvoie un
-// checkout_url : une page hébergée où le client choisit son réseau et paie.
-async function createPayment(env, { amount, description, customerEmail, customerFirstName, customerLastName, customerPhone }){
-  const idempotencyKey = crypto.randomUUID();
-  const res = await fetch(`${SASPAY_BASE_URL}/payments/softpay/`, {
+// Enveloppe SasPay : le contenu utile est dans "data".
+function unwrap(body){
+  return (body && body.data) ? body.data : (body || {});
+}
+
+async function createCheckoutSession(env, { amount, description, customerEmail, customerName }){
+  const res = await fetch(`${SASPAY_BASE_URL}/checkout-sessions/`, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${env.SASPAY_API_KEY}`,
-      "Content-Type": "application/json",
-      "Idempotency-Key": idempotencyKey
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      amount: Number(amount).toFixed(2), // doit être une chaîne décimale, ex "2500.00"
+      amount: Number(amount).toFixed(2),
       currency: "XOF",
-      country: "BF",
       description: description || "Commande Nion Market",
-      customer: {
-        email: customerEmail || "client@nionmarket.com",
-        first_name: customerFirstName || "Client",
-        last_name: customerLastName || "Nion Market",
-        phone: customerPhone || ""
-      }
+      customer_email: customerEmail || "client@nionmarket.com",
+      customer_name: customerName || "Client Nion Market",
+      return_url: RETURN_URL
     })
   });
-  const data = await res.json();
-  return { ok: res.status === 201, data };
+  const body = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, body };
 }
 
-// Vérifie le vrai statut d'un paiement — jamais de confiance en un simple délai.
-async function verifyPayment(env, paymentId){
-  const res = await fetch(`${SASPAY_BASE_URL}/payments/${encodeURIComponent(paymentId)}/verify/`, {
+async function getCheckoutStatus(env, sessionId){
+  const res = await fetch(`${SASPAY_BASE_URL}/checkout-sessions/${encodeURIComponent(sessionId)}/status/`, {
     headers: { "Authorization": `Bearer ${env.SASPAY_API_KEY}` }
   });
-  const data = await res.json();
-  return { ok: res.ok, data };
+  const body = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, body };
 }
 
 export default {
@@ -75,20 +70,29 @@ export default {
       return new Response(null, { headers: corsHeaders() });
     }
 
+    if(!env.SASPAY_API_KEY){
+      return json({ error: "config_missing", message: "Clé SasPay non configurée sur le Worker" }, 500);
+    }
+
     if(url.pathname === "/pay" && request.method === "POST"){
       try{
         const body = await request.json();
-        const { amount, description, customerEmail, customerFirstName, customerLastName, customerPhone } = body;
-        if(!amount || Number(amount) <= 0){ return json({ error: "amount requis" }, 400); }
+        const { amount, description, customerFirstName, customerLastName } = body;
+        if(!amount || Number(amount) <= 0){ return json({ error: "amount_invalid" }, 400); }
 
-        const { ok, data } = await createPayment(env, { amount, description, customerEmail, customerFirstName, customerLastName, customerPhone });
-        if(!ok){ return json({ error: "saspay_error", details: data }, 502); }
+        const customerName = `${customerFirstName || ""} ${customerLastName || ""}`.trim() || "Client Nion Market";
+        const r = await createCheckoutSession(env, { amount, description, customerName });
+        const payload = unwrap(r.body);
 
-        return json({
-          id: data.id || data.payment_id,
-          checkout_url: data.checkout_url || null,
-          status: data.status || "PENDING"
-        });
+        if(!r.ok || !payload.id || !payload.checkout_url){
+          return json({
+            error: "saspay_error",
+            saspayStatus: r.status,
+            message: payload.message || (r.body && r.body.message) || "Réponse SasPay incomplète"
+          }, 502);
+        }
+
+        return json({ id: payload.id, checkout_url: payload.checkout_url, status: payload.status || "PENDING" });
       }catch(err){
         return json({ error: "invalid_request", message: String(err) }, 400);
       }
@@ -96,12 +100,12 @@ export default {
 
     if(url.pathname === "/status" && request.method === "GET"){
       const id = url.searchParams.get("id");
-      if(!id){ return json({ error: "id manquant" }, 400); }
+      if(!id){ return json({ error: "id_missing" }, 400); }
       try{
-        const { ok, data } = await verifyPayment(env, id);
-        if(!ok){ return json({ error: "saspay_error", details: data }, 502); }
-        // "SUCCESS" est l'unique statut à considérer comme un paiement confirmé.
-        return json({ status: data.status, raw: data });
+        const r = await getCheckoutStatus(env, id);
+        if(!r.ok){ return json({ error: "saspay_error", saspayStatus: r.status }, 502); }
+        const payload = unwrap(r.body);
+        return json({ status: String(payload.status || "").toUpperCase() });
       }catch(err){
         return json({ error: "invalid_request", message: String(err) }, 400);
       }
@@ -110,4 +114,4 @@ export default {
     return json({ error: "not_found" }, 404);
   }
 };
-      
+    
